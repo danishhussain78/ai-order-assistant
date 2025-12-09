@@ -11,6 +11,23 @@ import tempfile
 import os
 from datetime import datetime
 
+import pyttsx3
+
+engine = pyttsx3.init()
+voices = engine.getProperty('voices')
+
+# Select male voice (on Windows, usually index 0 or 1)
+for v in voices:
+    print(v.id, v.name)
+engine.setProperty('voice', voices[0].id)  # choose male voice index
+
+def speak(text):
+    text = clean_tts_text(text)
+    print(f"AI: {text}")
+    engine.say(text)
+    engine.runAndWait()
+
+
 # -----------------------------
 # CONFIG
 # -----------------------------
@@ -65,56 +82,57 @@ def init_audio():
 
 audio_ready = init_audio()
 
-def speak(text):
-    """Speak text using gTTS (Google Text-to-Speech)"""
-    text = clean_tts_text(text) if text else ""
+# def speak(text):
+#     """Speak text using gTTS (Google Text-to-Speech)"""
+#     text = clean_tts_text(text) if text else ""
     
-    print(f"AI: {text}")
+#     print(f"AI: {text}")
     
-    if not USE_TTS or not audio_ready:
-        return
+#     if not USE_TTS or not audio_ready:
+#         return
     
-    if not text or len(text.strip()) == 0:
-        return
+#     if not text or len(text.strip()) == 0:
+#         return
     
-    temp_file = None
-    try:
-        # Create a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
-            temp_file = fp.name
+#     temp_file = None
+#     try:
+#         # Create a temporary file
+#         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
+#             temp_file = fp.name
         
-        print(f"🔊 Generating speech...")
-        # Generate speech with gTTS (tld='com.au' gives more natural male-like voice)
-        tts = gTTS(text=text, lang='en', slow=False, tld='co.uk')  # UK accent sounds more natural
-        tts.save(temp_file)
+#         print(f"🔊 Generating speech...")
+#         # Generate speech with gTTS (tld='com.au' gives more natural male-like voice)
+#         #make fast speak
+#         tts = gTTS(text=text, lang='hi', slow=False, tld='co.in')  # UK accent sounds more natural
+#         tts.save(temp_file)
         
-        print(f"🔊 Playing audio...")
-        # Load and play
-        pygame.mixer.music.load(temp_file)
-        pygame.mixer.music.play()
+#         print(f"🔊 Playing audio...")
+#         # Load and play
+#         pygame.mixer.music.load(temp_file)
+#         pygame.mixer.music.play()
         
-        # Wait for playback to finish
-        while pygame.mixer.music.get_busy():
-            pygame.time.Clock().tick(10)
+#         # Wait for playback to finish
+#         while pygame.mixer.music.get_busy():
+#             pygame.time.Clock().tick(10)
         
-        print("✅ Audio finished")
+#         print("✅ Audio finished")
         
-    except Exception as e:
-        print(f"❌ TTS Error: {e}")
-    finally:
-        # Cleanup
-        try:
-            pygame.mixer.music.stop()
-            pygame.mixer.music.unload()
-        except:
-            pass
+#     except Exception as e:
+#         print(f"❌ TTS Error: {e}")
+#     finally:
+#         # Cleanup
+#         try:
+#             pygame.mixer.music.stop()
+#             pygame.mixer.music.unload()
+#         except:
+#             pass
         
-        if temp_file and os.path.exists(temp_file):
-            try:
-                time.sleep(0.1)  # Small delay before deleting
-                os.unlink(temp_file)
-            except:
-                pass
+#         if temp_file and os.path.exists(temp_file):
+#             try:
+#                 time.sleep(0.1)  # Small delay before deleting
+#                 os.unlink(temp_file)
+#             except:
+#                 pass
 
 # -----------------------------
 # LOAD MENU
