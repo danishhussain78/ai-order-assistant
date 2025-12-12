@@ -14,8 +14,8 @@ from datetime import datetime
 # -----------------------------
 # CONFIG
 # -----------------------------
-OLLAMA_HOST = "http://localhost:11500"
-MODEL = "llama3.2:3b"
+OLLAMA_HOST = "http://10.0.3.3:11434/api/chat"
+MODEL = "llama3.1:8b"
 MENU_FILE = "menu.xlsx"
 USE_TTS = True
 ORDERS_FILE = "orders.json"
@@ -78,18 +78,18 @@ def speak(text):
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
             temp_file = fp.name
         
-        print(f"🔊 Generating speech...")
+        # print(f"🔊 Generating speech...")
         tts = gTTS(text=text, lang='en', slow=False, tld='co.uk')
         tts.save(temp_file)
         
-        print(f"🔊 Playing audio...")
+        # print(f"🔊 Playing audio...")
         pygame.mixer.music.load(temp_file)
         pygame.mixer.music.play()
         
         while pygame.mixer.music.get_busy():
             pygame.time.Clock().tick(10)
         
-        print("✅ Audio finished")
+        # print("✅ Audio finished")
         
     except Exception as e:
         print(f"❌ TTS Error: {e}")
@@ -146,7 +146,7 @@ def transcribe_microphone():
         
         try:
             audio = r.listen(source, timeout=5, phrase_time_limit=10)
-            print("🔄 Processing speech...")
+            # print("🔄 Processing speech...")
         except sr.WaitTimeoutError:
             print("❌ No speech detected")
             return None
@@ -289,53 +289,61 @@ def send_to_pos(order):
 # -----------------------------
 # LLM CALL
 # -----------------------------
-def call_llm(user_text, context=""):
-    """Call LLM for intelligent responses when rule-based system doesn't understand"""
-    
-    pizza_flavors_str = ", ".join([f.title() for f in PIZZA_FLAVORS])
-    
-    system_prompt = f"""You are a friendly restaurant order assistant. Be natural and conversational.
 
-AVAILABLE PIZZA FLAVORS: {pizza_flavors_str}
-AVAILABLE SIZES: Small, Regular, Medium, Large, XXL
-
-RULES:
-1. Keep responses SHORT (max 15 words)
-2. Be helpful and natural
-3. Only mention items from the menu above
-4. If customer asks about flavors/menu, list all flavors then say "and more"
-5. Guide them back to ordering
-7. Never make up menu items
-
-Context: {context}
-
-Respond naturally in ONE short sentence."""
-
+# -----------------------------
+# LLM CALL
+# -----------------------------
+def call_llm(messages):
+    """Call LLM with conversation history"""
     try:
-        r = requests.post(f"{OLLAMA_HOST}/api/chat", json={
+        # Use existing OLLAMA_HOST which already has /api/chat if user modified it, 
+        # but to be safe and consistent with user request:
+        url = OLLAMA_HOST 
+        
+        if "/api/chat" not in OLLAMA_HOST:
+             url = f"{OLLAMA_HOST}/api/chat"
+
+        # print(f"📡 Connecting to LLM at {url}...")
+        
+        payload = {
             "model": MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text}
-            ],
-            "stream": False,
+            "messages": messages,
             "options": {
                 "temperature": 0.3,
-                "num_predict": 50
+                "num_predict": 100
             }
-        }, timeout=15)
+        }
         
-        data = r.json()
-        response = data.get("message", {}).get("content", "") or data.get("completion", "")
+        response = requests.post(url, json=payload, stream=True, timeout=15)
+        full_response_text = ""
         
-        if response:
-            return response.strip()
+        # print("🤖 AI generating: ", end="", flush=True)
+        
+        for line in response.iter_lines():
+            if line:
+                try:
+                    data = json.loads(line.decode("utf-8"))
+                    if "message" in data:
+                        content = data["message"]["content"]
+                        # print(content, end="", flush=True)
+                        full_response_text += content
+                except:
+                    pass
+        # print() # Newline after streaming
+        
+        clean_text = full_response_text.strip()
+        
+        if clean_text:
+            # We return the RAW response now, so the tools are preserved for the parser.
+            # The cleaning will happen in query_llm or separate helper.
+            return clean_text, True 
         else:
-            return "Sorry, could you repeat that?"
+            return "Sorry, could you repeat that?", False
             
     except Exception as e:
-        print(f"❌ LLM Error: {e}")
-        return "I didn't catch that. Could you say it again?"
+        print(f"\n❌ LLM Error: {e}")
+        return "I didn't catch that. Could you say it again?", False
+
 
 # -----------------------------
 # MAIN ORDER SYSTEM
@@ -347,6 +355,97 @@ class OrderSystem:
         self.temp_item = {}
         self.customer_address = ""
         self.customer_phone = ""
+        
+        # Initialize conversation history
+        pizza_flavors_str = ", ".join([f.title() for f in PIZZA_FLAVORS])
+        self.system_prompt = f"""You are a friendly restaurant order assistant.
+
+AVAILABLE PIZZA FLAVORS: {pizza_flavors_str}
+AVAILABLE SIZES: Small, Regular, Medium, Large, XXL
+
+TOOLS:
+1. `[ADD_ITEM: {{"name": "...", "size": "...", "quantity": ...}}]` 
+   - Use this IMMEDIATELY when the user confirms an item.
+2. `[SET_DETAILS: {{"address": "...", "phone": "..."}}]`
+   - Use this when the user provides address and phone.
+3. `[SAVE_ORDER]`
+   - Use this ONLY when the order is CONFIRMED and you have address and phone.
+
+RULES:
+1. Keep responses SHORT (max 15 words).
+2. Use tools explicitly with valid JSON.
+3. If address/phone is missing, ask for it.
+4. Do NOT use `[SAVE_ORDER]` if you don't have the address and phone.
+5. Example: "Got it! [SET_DETAILS: {{"address": "123 Main", "phone": "555"}}] Confirm order?"
+
+Respond naturally."""
+
+        self.conversation_history = [
+            {"role": "system", "content": self.system_prompt}
+        ]
+
+    def add_user_message(self, text, context=""):
+        # Append user message with optional context injection
+        content = text
+        if context:
+            content = f"Instruction: {context}\nUser: {text}"
+        
+        self.conversation_history.append({"role": "user", "content": content})
+
+    def add_assistant_message(self, text):
+        self.conversation_history.append({"role": "assistant", "content": text})
+        
+    def query_llm(self, user_text, context=""):
+        self.add_user_message(user_text, context)
+        # Call LLM - getting RAW response now
+        response, _ = call_llm(self.conversation_history) 
+        
+        # Parse tools from raw response
+        self.parse_and_execute_tools(response)
+        
+        # Clean response for TTS and history (so tools don't pollute the context/speech)
+        cleaned_response = re.sub(r'\[.*?\]', '', response).strip()
+        if not cleaned_response: cleaned_response = "Done." # Fallback if only tool was output
+        
+        self.add_assistant_message(response) # Add raw response to history so LLM knows it called the tool
+        return cleaned_response, False 
+    
+    def parse_and_execute_tools(self, response):
+        """Parse and execute tools from LLM response"""
+        # Parse ADD_ITEM
+        add_item_match = re.search(r'\[ADD_ITEM: ({.*?})\]', response)
+        if add_item_match:
+            try:
+                item_data = json.loads(add_item_match.group(1))
+                self.current_order.append(item_data)
+                print(f"📦 Added item: {item_data}")
+            except Exception as e:
+                print(f"❌ Failed to parse item: {e}")
+        
+        # Parse SET_DETAILS
+        details_match = re.search(r'\[SET_DETAILS: ({.*?})\]', response)
+        if details_match:
+            try:
+                details = json.loads(details_match.group(1))
+                if "address" in details: self.customer_address = details["address"]
+                if "phone" in details: self.customer_phone = details["phone"]
+                print(f"📝 Details set: {details}")
+            except:
+                print("❌ Failed to parse details")
+                
+        # Parse SAVE_ORDER
+        if "[SAVE_ORDER]" in response:
+            if self.current_order and self.customer_address and self.customer_phone:
+                pos_resp = send_to_pos({
+                    "items": self.current_order,
+                    "address": self.customer_address,
+                    "phone": self.customer_phone
+                })
+                speak(f"Order {pos_resp['order_id']} placed successfully!")
+                time.sleep(1)
+                sys.exit(0) # Exit after saving
+            else:
+                print("❌ Missing details, cannot save yet.")
         
     def process_input(self, user_text):
         text_lower = user_text.lower()
@@ -414,10 +513,14 @@ class OrderSystem:
                 speak(f"Sure! {qty} pizza. Which flavor? Chicken Surprise, Jamaican BBQ, Chicago Bold Fold, or any other?")
         else:
             # Use LLM for greeting responses
-            print("🤖 Using AI to respond...")
+            # print("🤖 Using AI to respond...")
             context = "Customer just started conversation. Guide them to order pizza."
-            response = call_llm(user_text, context)
+            response, save_trigger = self.query_llm(user_text, context)
             speak(response)
+            if save_trigger:
+                 # If LLM triggered save here (unlikely in greeting but possible if user says "reorder last" etc)
+                 # For now just log it or ignore if no items.
+                 pass
         return "CONTINUE"
     
     def handle_ask_item(self, user_text):
@@ -450,10 +553,12 @@ class OrderSystem:
                 speak(f"{qty} pizza. Which flavor would you like?")
         else:
             # Use LLM for intelligent response
-            print("🤖 Using AI to understand...")
+            # print("🤖 Using AI to understand...")
             context = "Customer should order pizza. Guide them naturally."
-            response = call_llm(user_text, context)
+            response, save_trigger = self.query_llm(user_text, context)
             speak(response)
+            if save_trigger:
+                 pass # Cannot save without items
         return "CONTINUE"
     
     def handle_ask_flavor(self, user_text):
@@ -481,9 +586,9 @@ class OrderSystem:
             speak(f"{flavor.title()} pizza! Which size? Small, Regular, Medium, Large, or XXL?")
         else:
             # Use LLM for intelligent response
-            print("🤖 Using AI to understand...")
-            context = f"Customer is choosing pizza flavor. They said: '{user_text}'"
-            response = call_llm(user_text, context)
+            # print("🤖 Using AI to understand...")
+            context = f"Customer is choosing pizza flavor. Current state: Asking flavor."
+            response, save_trigger = self.query_llm(user_text, context)
             speak(response)
         return "CONTINUE"
     
@@ -502,9 +607,9 @@ class OrderSystem:
             self.state = OrderState.ASK_MORE
         else:
             # Use LLM for intelligent response
-            print("🤖 Using AI to understand size...")
-            context = f"Customer is choosing pizza size. Available: Small, Regular, Medium, Large, XXL. They said: '{user_text}'"
-            response = call_llm(user_text, context)
+            # print("🤖 Using AI to understand size...")
+            context = f"Customer is choosing pizza size. Available: Small, Regular, Medium, Large, XXL."
+            response, save_trigger = self.query_llm(user_text, context)
             speak(response)
         return "CONTINUE"
     
@@ -529,10 +634,22 @@ class OrderSystem:
                 speak(f"{qty} pizza. Which flavor?")
         else:
             # Use LLM for intelligent response
-            print("🤖 Using AI to understand...")
-            context = f"Customer can add more items or finish order. They said: '{user_text}'"
-            response = call_llm(user_text, context)
+            # print("🤖 Using AI to understand...")
+            context = f"Customer can add more items or finish order. Current items: {len(self.current_order)}"
+            response, save_trigger = self.query_llm(user_text, context)
             speak(response)
+            
+            if save_trigger:
+                if len(self.current_order) > 0:
+                    pos_resp = send_to_pos({
+                        "items": self.current_order,
+                        "address": self.customer_address,
+                        "phone": self.customer_phone
+                    })
+                    speak(f"Order saved by AI command. Order ID {pos_resp['order_id']}.")
+                    return "EXIT"
+                else:
+                    speak("I can't save an empty order.")
         return "CONTINUE"
     
     def handle_collect_address(self, user_text):
