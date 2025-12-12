@@ -11,23 +11,6 @@ import tempfile
 import os
 from datetime import datetime
 
-import pyttsx3
-
-engine = pyttsx3.init()
-voices = engine.getProperty('voices')
-
-# Select male voice (on Windows, usually index 0 or 1)
-for v in voices:
-    print(v.id, v.name)
-engine.setProperty('voice', voices[0].id)  # choose male voice index
-
-def speak(text):
-    text = clean_tts_text(text)
-    print(f"AI: {text}")
-    engine.say(text)
-    engine.runAndWait()
-
-
 # -----------------------------
 # CONFIG
 # -----------------------------
@@ -35,7 +18,20 @@ OLLAMA_HOST = "http://localhost:11500"
 MODEL = "llama3.2:3b"
 MENU_FILE = "menu.xlsx"
 USE_TTS = True
-ORDERS_FILE = "orders.json"  # File to save confirmed orders
+ORDERS_FILE = "orders.json"
+ORDER_STATE_FILE = "current_order_state.json"
+
+# Order state tracking
+class OrderState:
+    GREETING = "greeting"
+    ASK_ITEM = "ask_item"
+    ASK_FLAVOR = "ask_flavor"
+    ASK_SIZE = "ask_size"
+    ASK_MORE = "ask_more"
+    COLLECT_ADDRESS = "collect_address"
+    COLLECT_PHONE = "collect_phone"
+    CONFIRM_ORDER = "confirm_order"
+    COMPLETED = "completed"
 
 # -----------------------------
 # TEXT CLEANING
@@ -45,31 +41,19 @@ def clean_tts_text(text):
     if not text:
         return ""
     
-    # Remove emojis and non-ASCII characters
     text = text.encode("ascii", "ignore").decode()
-    
-    # Remove markdown formatting
     text = re.sub(r'[*_`~#]', '', text)
-    
-    # Remove weird unicode spaces & control chars
     text = re.sub(r"[\u2028\u2029\u200b-\u200f]", "", text)
-    
-    # Remove newlines and tabs
     text = text.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
-    
-    # Collapse multiple spaces
     text = re.sub(r"\s+", " ", text)
-    
-    # Remove quotes that might cause issues
     text = text.replace('"', '').replace("'", '')
     
     return text.strip()
 
 # -----------------------------
-# SETUP TTS (using gTTS)
+# SETUP TTS
 # -----------------------------
 def init_audio():
-    """Initialize pygame mixer for audio playback"""
     if not USE_TTS:
         return False
     try:
@@ -82,57 +66,46 @@ def init_audio():
 
 audio_ready = init_audio()
 
-# def speak(text):
-#     """Speak text using gTTS (Google Text-to-Speech)"""
-#     text = clean_tts_text(text) if text else ""
+def speak(text):
+    text = clean_tts_text(text) if text else ""
+    print(f"AI: {text}")
     
-#     print(f"AI: {text}")
+    if not USE_TTS or not audio_ready or not text or len(text.strip()) == 0:
+        return
     
-#     if not USE_TTS or not audio_ready:
-#         return
-    
-#     if not text or len(text.strip()) == 0:
-#         return
-    
-#     temp_file = None
-#     try:
-#         # Create a temporary file
-#         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
-#             temp_file = fp.name
+    temp_file = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
+            temp_file = fp.name
         
-#         print(f"🔊 Generating speech...")
-#         # Generate speech with gTTS (tld='com.au' gives more natural male-like voice)
-#         #make fast speak
-#         tts = gTTS(text=text, lang='hi', slow=False, tld='co.in')  # UK accent sounds more natural
-#         tts.save(temp_file)
+        print(f"🔊 Generating speech...")
+        tts = gTTS(text=text, lang='en', slow=False, tld='co.uk')
+        tts.save(temp_file)
         
-#         print(f"🔊 Playing audio...")
-#         # Load and play
-#         pygame.mixer.music.load(temp_file)
-#         pygame.mixer.music.play()
+        print(f"🔊 Playing audio...")
+        pygame.mixer.music.load(temp_file)
+        pygame.mixer.music.play()
         
-#         # Wait for playback to finish
-#         while pygame.mixer.music.get_busy():
-#             pygame.time.Clock().tick(10)
+        while pygame.mixer.music.get_busy():
+            pygame.time.Clock().tick(10)
         
-#         print("✅ Audio finished")
+        print("✅ Audio finished")
         
-#     except Exception as e:
-#         print(f"❌ TTS Error: {e}")
-#     finally:
-#         # Cleanup
-#         try:
-#             pygame.mixer.music.stop()
-#             pygame.mixer.music.unload()
-#         except:
-#             pass
+    except Exception as e:
+        print(f"❌ TTS Error: {e}")
+    finally:
+        try:
+            pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
+        except:
+            pass
         
-#         if temp_file and os.path.exists(temp_file):
-#             try:
-#                 time.sleep(0.1)  # Small delay before deleting
-#                 os.unlink(temp_file)
-#             except:
-#                 pass
+        if temp_file and os.path.exists(temp_file):
+            try:
+                time.sleep(0.1)
+                os.unlink(temp_file)
+            except:
+                pass
 
 # -----------------------------
 # LOAD MENU
@@ -141,14 +114,22 @@ def load_menu(file_path):
     df = pd.read_excel(file_path)
     menu_dict = {}
     menu_items_flat = []
+    
+    pizza_flavors = []
+    pizza_sizes = ["small", "regular", "medium", "large", "xxl"]
+    
     for _, row in df.iterrows():
         cat = row["Category"].strip()
         item = row["Item"].strip()
         menu_dict.setdefault(cat, []).append(item)
         menu_items_flat.append(item.lower())
-    return menu_dict, menu_items_flat
+        
+        if "pizza" in cat.lower() or "flavor" in cat.lower():
+            pizza_flavors.append(item.lower())
+    
+    return menu_dict, menu_items_flat, pizza_flavors, pizza_sizes
 
-MENU, MENU_ITEMS_FLAT = load_menu(MENU_FILE)
+MENU, MENU_ITEMS_FLAT, PIZZA_FLAVORS, PIZZA_SIZES = load_menu(MENU_FILE)
 
 # -----------------------------
 # SPEECH TO TEXT
@@ -181,41 +162,18 @@ def transcribe_microphone():
         print(f"❌ Speech recognition failed: {e}")
         return None
 
-# -----------------------------
-# LLM CALL
-# -----------------------------
-def call_llm(messages, system_prompt=None):
-    msgs = messages.copy()
-    if system_prompt:
-        msgs.insert(0, {"role": "system", "content": system_prompt})
-    
-    try:
-        r = requests.post(f"{OLLAMA_HOST}/api/chat", json={
-            "model": MODEL,
-            "messages": msgs,
-            "stream": False,
-            "options": {
-                "temperature": 0.7,
-                "num_predict": 100
-            }
-        }, timeout=30)
-        
-        data = r.json()
-        response = data.get("message", {}).get("content", "") or data.get("completion", "")
-
-        if response:
-            return response.strip()
-        else:
-            return "I'm having trouble right now. Could you repeat that?"
-            
-    except requests.exceptions.Timeout:
-        return "Sorry, I'm taking too long to think. Can you repeat that?"
-    except Exception as e:
-        print(f"❌ AI Error: {e}")
-        return "I'm having trouble processing that. Could you say it again?"
+def get_user_input(voice_mode=True):
+    if voice_mode:
+        user_text = transcribe_microphone()
+        if user_text:
+            return user_text
+        print("⌨️ Voice recognition failed. Please type your response:")
+        return input("You: ").strip()
+    else:
+        return input("You: ").strip()
 
 # -----------------------------
-# ORDER PARSER
+# ORDER PARSING HELPERS
 # -----------------------------
 def extract_quantity(text):
     number_words = {
@@ -233,43 +191,38 @@ def extract_quantity(text):
     
     return 1
 
-def parse_order(user_text, menu, menu_flat):
-    items_found = []
-    text_lower = user_text.lower()
-    
-    for cat, items in menu.items():
-        for item in items:
-            item_lower = item.lower()
-            if item_lower in text_lower:
-                idx = text_lower.find(item_lower)
-                context = text_lower[max(0, idx-20):idx+len(item_lower)+5]
-                qty = extract_quantity(context)
-                
-                items_found.append({
-                    "category": cat,
-                    "name": item,
-                    "quantity": qty
-                })
-    
-    return items_found
+def detect_pizza_flavor(text):
+    text_lower = text.lower()
+    for flavor in PIZZA_FLAVORS:
+        if flavor in text_lower:
+            return flavor
+    return None
+
+def detect_pizza_size(text):
+    text_lower = text.lower()
+    for size in PIZZA_SIZES:
+        if size in text_lower:
+            return size
+    return None
+
+def is_pizza_request(text):
+    text_lower = text.lower()
+    pizza_keywords = ["pizza", "pie"]
+    return any(keyword in text_lower for keyword in pizza_keywords)
 
 # -----------------------------
 # ORDER SAVING
 # -----------------------------
 def save_order_to_file(order_data):
-    """Save confirmed order to JSON file"""
     try:
-        # Load existing orders
         if os.path.exists(ORDERS_FILE):
             with open(ORDERS_FILE, 'r') as f:
                 orders = json.load(f)
         else:
             orders = []
         
-        # Add new order
         orders.append(order_data)
         
-        # Save back to file
         with open(ORDERS_FILE, 'w') as f:
             json.dump(orders, f, indent=2)
         
@@ -279,21 +232,48 @@ def save_order_to_file(order_data):
         print(f"❌ Failed to save order: {e}")
         return False
 
+def save_order_to_csv(order_data):
+    try:
+        csv_file = "orders.csv"
+        
+        csv_data = {
+            'Order ID': order_data['order_id'],
+            'Timestamp': order_data['timestamp'],
+            'Items': '; '.join([f"{item['quantity']}x {item['size']} {item['name']}" for item in order_data['items']]),
+            'Address': order_data.get('address', ''),
+            'Phone': order_data.get('phone', ''),
+            'Total Items': order_data['total_items'],
+            'Status': order_data['status']
+        }
+        
+        file_exists = os.path.exists(csv_file)
+        df = pd.DataFrame([csv_data])
+        
+        if file_exists:
+            df.to_csv(csv_file, mode='a', header=False, index=False)
+        else:
+            df.to_csv(csv_file, mode='w', header=True, index=False)
+        
+        print(f"✅ Order saved to {csv_file}")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to save order to CSV: {e}")
+        return False
+
 # -----------------------------
-# POS API MOCK
+# POS API
 # -----------------------------
 def send_to_pos(order):
-    """Send order to POS system and save to file"""
     import random
-    from datetime import datetime
     
     order_id = f"ORD{random.randint(1000,9999)}"
     
-    # Create complete order data
     order_data = {
         "order_id": order_id,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "items": order["items"],
+        "address": order.get("address", ""),
+        "phone": order.get("phone", ""),
         "total_items": len(order["items"]),
         "status": "confirmed"
     }
@@ -301,156 +281,326 @@ def send_to_pos(order):
     print("\n🧾 Sending order to POS...")
     print(json.dumps(order_data, indent=2))
     
-    # Save to JSON file
     save_order_to_file(order_data)
+    save_order_to_csv(order_data)
     
     return {"status": "success", "order_id": order_id}
 
 # -----------------------------
-# ORDER SUMMARY
+# LLM CALL
 # -----------------------------
-def generate_order_summary(order_items):
-    if not order_items:
-        return "No items ordered."
+def call_llm(user_text, context=""):
+    """Call LLM for intelligent responses when rule-based system doesn't understand"""
     
-    summary_lines = []
-    for item in order_items:
-        summary_lines.append(f"{item['quantity']} {item['name']}")
+    pizza_flavors_str = ", ".join([f.title() for f in PIZZA_FLAVORS])
     
-    return ", ".join(summary_lines)
+    system_prompt = f"""You are a friendly restaurant order assistant. Be natural and conversational.
+
+AVAILABLE PIZZA FLAVORS: {pizza_flavors_str}
+AVAILABLE SIZES: Small, Regular, Medium, Large, XXL
+
+RULES:
+1. Keep responses SHORT (max 15 words)
+2. Be helpful and natural
+3. Only mention items from the menu above
+4. If customer asks about flavors/menu, list all flavors then say "and more"
+5. Guide them back to ordering
+7. Never make up menu items
+
+Context: {context}
+
+Respond naturally in ONE short sentence."""
+
+    try:
+        r = requests.post(f"{OLLAMA_HOST}/api/chat", json={
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text}
+            ],
+            "stream": False,
+            "options": {
+                "temperature": 0.3,
+                "num_predict": 50
+            }
+        }, timeout=15)
+        
+        data = r.json()
+        response = data.get("message", {}).get("content", "") or data.get("completion", "")
+        
+        if response:
+            return response.strip()
+        else:
+            return "Sorry, could you repeat that?"
+            
+    except Exception as e:
+        print(f"❌ LLM Error: {e}")
+        return "I didn't catch that. Could you say it again?"
 
 # -----------------------------
-# CONVERSATION MEMORY
+# MAIN ORDER SYSTEM
 # -----------------------------
-conversation_memory = []
-current_order = []
+class OrderSystem:
+    def __init__(self):
+        self.state = OrderState.GREETING
+        self.current_order = []
+        self.temp_item = {}
+        self.customer_address = ""
+        self.customer_phone = ""
+        
+    def process_input(self, user_text):
+        text_lower = user_text.lower()
+        
+        # Handle exit commands
+        if text_lower in ["exit", "quit", "bye", "cancel"]:
+            speak("Thanks for calling! Have a great day!")
+            return "EXIT"
+        
+        # State machine
+        if self.state == OrderState.GREETING:
+            return self.handle_greeting(user_text)
+            
+        elif self.state == OrderState.ASK_ITEM:
+            return self.handle_ask_item(user_text)
+            
+        elif self.state == OrderState.ASK_FLAVOR:
+            return self.handle_ask_flavor(user_text)
+            
+        elif self.state == OrderState.ASK_SIZE:
+            return self.handle_ask_size(user_text)
+            
+        elif self.state == OrderState.ASK_MORE:
+            return self.handle_ask_more(user_text)
+            
+        elif self.state == OrderState.COLLECT_ADDRESS:
+            return self.handle_collect_address(user_text)
+            
+        elif self.state == OrderState.COLLECT_PHONE:
+            return self.handle_collect_phone(user_text)
+            
+        elif self.state == OrderState.CONFIRM_ORDER:
+            return self.handle_confirm_order(user_text)
+    
+    def handle_greeting(self, user_text):
+        text_lower = user_text.lower()
+        
+        # Check if asking for menu first
+        menu_keywords = ["what", "which", "list", "menu", "have", "available", "options", "flavors", "flavours", "all", "tell me"]
+        if any(keyword in text_lower for keyword in menu_keywords) and not is_pizza_request(text_lower):
+            flavor_list = [flavor.title() for flavor in PIZZA_FLAVORS]
+            
+            # If they want ALL flavors
+            if "all" in text_lower or "tell me all" in text_lower:
+                flavors_str = ", ".join(flavor_list)
+                speak(f"We have {flavors_str}. What would you like to order?")
+            else:
+                flavors_str = ", ".join(flavor_list[:8])
+                speak(f"We have pizzas like {flavors_str}, and more. What would you like?")
+            self.state = OrderState.ASK_ITEM
+            return "CONTINUE"
+        
+        if is_pizza_request(user_text):
+            qty = extract_quantity(user_text)
+            self.temp_item = {"quantity": qty, "category": "Pizza"}
+            
+            # Check if flavor is already mentioned
+            flavor = detect_pizza_flavor(user_text)
+            if flavor:
+                self.temp_item["name"] = flavor.title()
+                self.state = OrderState.ASK_SIZE
+                speak(f"Great! {qty} {flavor.title()} pizza. Which size? Small, Regular, Medium, Large, or XXL?")
+            else:
+                self.state = OrderState.ASK_FLAVOR
+                speak(f"Sure! {qty} pizza. Which flavor? Chicken Surprise, Jamaican BBQ, Chicago Bold Fold, or any other?")
+        else:
+            # Use LLM for greeting responses
+            print("🤖 Using AI to respond...")
+            context = "Customer just started conversation. Guide them to order pizza."
+            response = call_llm(user_text, context)
+            speak(response)
+        return "CONTINUE"
+    
+    def handle_ask_item(self, user_text):
+        text_lower = user_text.lower()
+        
+        # Check for menu inquiry
+        menu_keywords = ["what", "which", "list", "menu", "have", "available", "all", "tell me"]
+        if any(keyword in text_lower for keyword in menu_keywords):
+            flavor_list = [flavor.title() for flavor in PIZZA_FLAVORS]
+            
+            if "all" in text_lower or "tell me all" in text_lower:
+                flavors_str = ", ".join(flavor_list)
+                speak(f"We have {flavors_str}. What would you like?")
+            else:
+                flavors_str = ", ".join(flavor_list[:8])
+                speak(f"We have {flavors_str}, and more. What would you like?")
+            return "CONTINUE"
+        
+        if is_pizza_request(user_text):
+            qty = extract_quantity(user_text)
+            self.temp_item = {"quantity": qty, "category": "Pizza"}
+            
+            flavor = detect_pizza_flavor(user_text)
+            if flavor:
+                self.temp_item["name"] = flavor.title()
+                self.state = OrderState.ASK_SIZE
+                speak(f"{qty} {flavor.title()} pizza. Which size?")
+            else:
+                self.state = OrderState.ASK_FLAVOR
+                speak(f"{qty} pizza. Which flavor would you like?")
+        else:
+            # Use LLM for intelligent response
+            print("🤖 Using AI to understand...")
+            context = "Customer should order pizza. Guide them naturally."
+            response = call_llm(user_text, context)
+            speak(response)
+        return "CONTINUE"
+    
+    def handle_ask_flavor(self, user_text):
+        text_lower = user_text.lower()
+        
+        # Check if asking for menu/flavors list
+        menu_keywords = ["what", "which", "list", "menu", "flavors", "flavours", "options", "have", "available", "all", "tell me"]
+        if any(keyword in text_lower for keyword in menu_keywords):
+            # List all pizza flavors
+            flavor_list = [flavor.title() for flavor in PIZZA_FLAVORS]
+            
+            # If they want ALL flavors, show more
+            if "all" in text_lower or "tell me" in text_lower:
+                flavors_str = ", ".join(flavor_list)
+                speak(f"We have {flavors_str}. Which one would you like?")
+            else:
+                flavors_str = ", ".join(flavor_list[:5]) + ", and more"
+                speak(f"We have {flavors_str}. Which one would you like?")
+            return "CONTINUE"
+        
+        flavor = detect_pizza_flavor(user_text)
+        if flavor:
+            self.temp_item["name"] = flavor.title()
+            self.state = OrderState.ASK_SIZE
+            speak(f"{flavor.title()} pizza! Which size? Small, Regular, Medium, Large, or XXL?")
+        else:
+            # Use LLM for intelligent response
+            print("🤖 Using AI to understand...")
+            context = f"Customer is choosing pizza flavor. They said: '{user_text}'"
+            response = call_llm(user_text, context)
+            speak(response)
+        return "CONTINUE"
+    
+    def handle_ask_size(self, user_text):
+        size = detect_pizza_size(user_text)
+        if size:
+            self.temp_item["size"] = size.title()
+            self.current_order.append(self.temp_item.copy())
+            
+            qty = self.temp_item["quantity"]
+            name = self.temp_item["name"]
+            size_str = size.title()
+            
+            speak(f"Perfect! {qty} {size_str} {name} added. Anything else?")
+            self.temp_item = {}
+            self.state = OrderState.ASK_MORE
+        else:
+            # Use LLM for intelligent response
+            print("🤖 Using AI to understand size...")
+            context = f"Customer is choosing pizza size. Available: Small, Regular, Medium, Large, XXL. They said: '{user_text}'"
+            response = call_llm(user_text, context)
+            speak(response)
+        return "CONTINUE"
+    
+    def handle_ask_more(self, user_text):
+        text_lower = user_text.lower()
+        
+        if any(word in text_lower for word in ["no", "nope", "that's all", "thats all", "done", "finish", "nothing", "bas", "enough"]):
+            self.state = OrderState.COLLECT_ADDRESS
+            speak("Great! Now, please provide your full delivery address.")
+            return "CONTINUE"
+        elif is_pizza_request(text_lower):
+            qty = extract_quantity(user_text)
+            self.temp_item = {"quantity": qty, "category": "Pizza"}
+            
+            flavor = detect_pizza_flavor(user_text)
+            if flavor:
+                self.temp_item["name"] = flavor.title()
+                self.state = OrderState.ASK_SIZE
+                speak(f"{qty} {flavor.title()} pizza. Which size?")
+            else:
+                self.state = OrderState.ASK_FLAVOR
+                speak(f"{qty} pizza. Which flavor?")
+        else:
+            # Use LLM for intelligent response
+            print("🤖 Using AI to understand...")
+            context = f"Customer can add more items or finish order. They said: '{user_text}'"
+            response = call_llm(user_text, context)
+            speak(response)
+        return "CONTINUE"
+    
+    def handle_collect_address(self, user_text):
+        self.customer_address = user_text
+        self.state = OrderState.COLLECT_PHONE
+        speak("Got it! And your phone number please?")
+        return "CONTINUE"
+    
+    def handle_collect_phone(self, user_text):
+        # Extract phone number
+        phone_match = re.search(r'\d{10,11}', user_text.replace(" ", ""))
+        if phone_match:
+            self.customer_phone = phone_match.group()
+            self.state = OrderState.CONFIRM_ORDER
+            
+            # Show summary
+            print("\n" + "="*60)
+            print("📋 ORDER SUMMARY")
+            print("="*60)
+            for i, item in enumerate(self.current_order, 1):
+                print(f"{i}. {item['quantity']}x {item['size']} {item['name']}")
+            print(f"\nAddress: {self.customer_address}")
+            print(f"Phone: {self.customer_phone}")
+            print("="*60 + "\n")
+            
+            summary = ", ".join([f"{item['quantity']} {item['size']} {item['name']}" for item in self.current_order])
+            speak(f"Let me confirm. {summary}. Delivering to {self.customer_address}. Phone {self.customer_phone}. Is this correct?")
+        else:
+            speak("I didn't catch the phone number. Please say it again?")
+        return "CONTINUE"
+    
+    def handle_confirm_order(self, user_text):
+        text_lower = user_text.lower()
+        
+        if "yes" in text_lower or "correct" in text_lower or "confirm" in text_lower:
+            pos_resp = send_to_pos({
+                "items": self.current_order,
+                "address": self.customer_address,
+                "phone": self.customer_phone
+            })
+            
+            speak(f"Perfect! Your order {pos_resp['order_id']} is confirmed. Estimated delivery in 30-45 minutes. Thank you!")
+            print(f"\n✅ Order {pos_resp['order_id']} saved successfully!")
+            return "EXIT"
+        else:
+            speak("No problem. What would you like to change?")
+            self.state = OrderState.ASK_MORE
+        return "CONTINUE"
 
 # -----------------------------
-# SYSTEM PROMPT
-# -----------------------------
-SYSTEM_PROMPT = f"""You are a friendly restaurant order-taking assistant. Follow these rules strictly:
-
-1. ONLY mention items from this menu: {', '.join(MENU_ITEMS_FLAT)}
-2. Be VERY concise - maximum 15 words in your response
-3. Be natural and conversational like a real human server
-4. If customer asks for items NOT on the menu, politely say "Sorry, we don't have that" and suggest similar items
-5. Help customers with quantities or clarifications
-6. Never make up menu items
-7. Don't ask multiple questions at once
-
-Available menu items: {', '.join(MENU_ITEMS_FLAT)}
-
-Respond in ONE short sentence only."""
-
-# -----------------------------
-# AGENT LOOP
+# MAIN FUNCTION
 # -----------------------------
 def main():
-    global current_order, conversation_memory
-    
-    # Test TTS
-    # print("\n🧪 Testing audio system...")
-    # speak("Testing audio. If you hear this, TTS is working.")
-    # time.sleep(0.5)  # Wait between tests
-    
-    # speak("Second test. Can you hear this too?")
-    # time.sleep(0.5)
+    order_system = OrderSystem()
+    voice_mode = False  # Set to False for text-only mode
     
     speak("Hi! Welcome to our restaurant. What can I get you today?")
-
+    
     while True:
-        mode = "voice"  # Default to voice mode
+        user_text = get_user_input(voice_mode)
         
-        if mode == "finish":
-            if current_order:
-                summary = generate_order_summary(current_order)
-                speak(f"Let me confirm: {summary}. Is this correct?")
-                
-                confirm = input("Confirm order? (yes/no): ").strip().lower()
-                if confirm == "yes":
-                    pos_resp = send_to_pos({"items": current_order})
-                    speak(f"Perfect! Your order is placed. Order number {pos_resp['order_id']}. Thank you!")
-                    current_order = []
-                    conversation_memory = []
-                else:
-                    speak("No problem. What would you like to change?")
-                    continue
-            else:
-                speak("You haven't ordered anything yet. What would you like?")
-            continue
-
-        # Get user input
-        if mode == "voice":
-            user_text = transcribe_microphone()
-        else:
-            user_text = input("You: ").strip()
-
         if not user_text:
             continue
-
-        if user_text.lower() in ["exit", "quit", "bye", "cancel", "finish", "done", "that's all", "thats all"]:
-            if user_text.lower() in ["finish", "done", "that's all", "thats all"] and current_order:
-                # Show order summary
-                print("\n" + "="*50)
-                print("📋 ORDER SUMMARY")
-                print("="*50)
-                for i, item in enumerate(current_order, 1):
-                    print(f"{i}. {item['quantity']}x {item['name']} ({item['category']})")
-                print("="*50 + "\n")
-                
-                summary = generate_order_summary(current_order)
-                speak(f"Let me confirm your order: {summary}.")
-                
-                # Voice confirmation
-                speak("Please say yes to confirm, or no to cancel.")
-                confirm_response = transcribe_microphone()
-                
-                if confirm_response and "yes" in confirm_response.lower():
-                    pos_resp = send_to_pos({"items": current_order})
-                    speak(f"Perfect! Your order is confirmed. Order number {pos_resp['order_id']}. Thank you!")
-                    current_order = []
-                    conversation_memory = []
-                    break
-                else:
-                    speak("Order cancelled. What would you like to change?")
-                    continue
-            else:
-                speak("Thanks for visiting! Have a great day!")
-                break
-
-        # Add to conversation memory
-        conversation_memory.append({"role": "user", "content": user_text})
-
-        # Parse for menu items
-        found_items = parse_order(user_text, MENU, MENU_ITEMS_FLAT)
-
-        if found_items:
-            for item in found_items:
-                existing = next((x for x in current_order if x['name'] == item['name']), None)
-                if existing:
-                    existing['quantity'] += item['quantity']
-                else:
-                    current_order.append(item)
-            
-            items_str = ", ".join([f"{it['quantity']} {it['name']}" for it in found_items])
-            response = f"Got it! Added {items_str}. Anything else?"
-            conversation_memory.append({"role": "assistant", "content": response})
-            speak(response)
-        else:
-            print("📝 Asking AI...")
-            response = call_llm(conversation_memory, SYSTEM_PROMPT)
-            
-            if response and len(response.strip()) > 0:
-                conversation_memory.append({"role": "assistant", "content": response})
-                speak(response)
-            else:
-                fallback = "Sorry, could you repeat that?"
-                conversation_memory.append({"role": "assistant", "content": fallback})
-                speak(fallback)
         
-        # Keep conversation memory manageable
-        if len(conversation_memory) > 20:
-            conversation_memory = conversation_memory[-20:]
+        result = order_system.process_input(user_text)
+        
+        if result == "EXIT":
+            break
 
 if __name__ == "__main__":
     main()
