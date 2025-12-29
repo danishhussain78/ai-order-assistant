@@ -9,13 +9,14 @@ import re
 import time
 import tempfile
 import os
+import ast
 from datetime import datetime
 
 # -----------------------------
 # CONFIG
 # -----------------------------
 OLLAMA_HOST = "http://localhost:11500"
-MODEL = "llama3.2:3b"
+MODEL = "llama3.1:8b"
 MENU_FILE = "menu.xlsx"
 USE_TTS = False
 ORDERS_FILE = "orders.json"
@@ -78,18 +79,18 @@ def speak(text):
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
             temp_file = fp.name
         
-        print(f"🔊 Generating speech...")
+        # print(f"🔊 Generating speech...")
         tts = gTTS(text=text, lang='en', slow=False, tld='co.uk')
         tts.save(temp_file)
         
-        print(f"🔊 Playing audio...")
+        # print(f"🔊 Playing audio...")
         pygame.mixer.music.load(temp_file)
         pygame.mixer.music.play()
         
         while pygame.mixer.music.get_busy():
             pygame.time.Clock().tick(10)
         
-        print("✅ Audio finished")
+        # print("✅ Audio finished")
         
     except Exception as e:
         print(f"❌ TTS Error: {e}")
@@ -146,7 +147,7 @@ def transcribe_microphone():
         
         try:
             audio = r.listen(source, timeout=5, phrase_time_limit=10)
-            print("🔄 Processing speech...")
+            # print("🔄 Processing speech...")
         except sr.WaitTimeoutError:
             print("❌ No speech detected")
             return None
@@ -200,14 +201,33 @@ def detect_pizza_flavor(text):
 
 def detect_pizza_size(text):
     text_lower = text.lower()
+    
+    # Fuzzy/Typo match FIRST (to catch 'extra large' before 'large')
+    typo_map = {
+        "smal": "small", "sml": "small",
+        "reg": "regular", "normal": "regular",
+        "med": "medium", "medum": "medium", 
+        "larj": "large", "larg": "large", "lrg": "large",
+        "xl": "xxl", "extra large": "xxl"
+    }
+    
+    # Sort keys by length descending to match "extra large" before "large"
+    sorted_typos = sorted(typo_map.keys(), key=len, reverse=True)
+    
+    for typo in sorted_typos:
+        if typo in text_lower:
+            return typo_map[typo]
+
+    # Direct match
     for size in PIZZA_SIZES:
         if size in text_lower:
             return size
+            
     return None
 
 def is_pizza_request(text):
     text_lower = text.lower()
-    pizza_keywords = ["pizza", "pie"]
+    pizza_keywords = ["pizza", "pie", "piza", "picza", "pizz", "slice"]
     return any(keyword in text_lower for keyword in pizza_keywords)
 
 # -----------------------------
@@ -261,9 +281,50 @@ def save_order_to_csv(order_data):
         return False
 
 # -----------------------------
+# VALIDATION HELPERS
+# -----------------------------
+def is_valid_address(address):
+    return address and len(address) >= 5 and "..." not in address
+
+def is_valid_phone(phone):
+    return phone and len(phone) >= 9 and any(c.isdigit() for c in phone)
+
+# -----------------------------
 # POS API
 # -----------------------------
+def validate_order(order):
+    """Validate order details before sending to POS"""
+    missing = []
+    
+    # Validate Items
+    if not order.get("items") or len(order["items"]) == 0:
+        missing.append("items")
+    else:
+        for i, item in enumerate(order["items"]):
+            if item.get("size") in ["...", "", None]:
+                missing.append(f"size for item {i+1}")
+            if item.get("name") in ["...", "", None]:
+                missing.append(f"name for item {i+1}")
+                
+    # Validate Address
+    if not is_valid_address(order.get("address", "")):
+        missing.append("valid address")
+        
+    # Validate Phone
+    if not is_valid_phone(order.get("phone", "")):
+        missing.append("valid phone number")
+        
+    if missing:
+        return False, f"Missing details: {', '.join(missing)}"
+    return True, "Valid"
+
 def send_to_pos(order):
+    # Validation Step
+    is_valid, msg = validate_order(order)
+    if not is_valid:
+        print(f"❌ Order validation failed: {msg}")
+        return {"status": "error", "message": msg}
+
     import random
     
     order_id = f"ORD{random.randint(1000,9999)}"
@@ -289,53 +350,61 @@ def send_to_pos(order):
 # -----------------------------
 # LLM CALL
 # -----------------------------
-def call_llm(user_text, context=""):
-    """Call LLM for intelligent responses when rule-based system doesn't understand"""
-    
-    pizza_flavors_str = ", ".join([f.title() for f in PIZZA_FLAVORS])
-    
-    system_prompt = f"""You are a friendly restaurant order assistant. Be natural and conversational.
 
-AVAILABLE PIZZA FLAVORS: {pizza_flavors_str}
-AVAILABLE SIZES: Small, Regular, Medium, Large, XXL
-
-RULES:
-1. Keep responses SHORT (max 15 words)
-2. Be helpful and natural
-3. Only mention items from the menu above
-4. If customer asks about flavors/menu, list all flavors then say "and more"
-5. Guide them back to ordering
-7. Never make up menu items
-
-Context: {context}
-
-Respond naturally in ONE short sentence."""
-
+# -----------------------------
+# LLM CALL
+# -----------------------------
+def call_llm(messages):
+    """Call LLM with conversation history"""
     try:
-        r = requests.post(f"{OLLAMA_HOST}/api/chat", json={
+        # Use existing OLLAMA_HOST which already has /api/chat if user modified it, 
+        # but to be safe and consistent with user request:
+        url = OLLAMA_HOST 
+        
+        if "/api/chat" not in OLLAMA_HOST:
+             url = f"{OLLAMA_HOST}/api/chat"
+
+        # print(f"📡 Connecting to LLM at {url}...")
+        
+        payload = {
             "model": MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text}
-            ],
-            "stream": False,
+            "messages": messages,
             "options": {
                 "temperature": 0.3,
-                "num_predict": 30
+                "num_predict": 100
             }
-        }, timeout=15)
+        }
         
-        data = r.json()
-        response = data.get("message", {}).get("content", "") or data.get("completion", "")
+        response = requests.post(url, json=payload, stream=True, timeout=15)
+        full_response_text = ""
         
-        if response:
-            return response.strip()
+        # print("🤖 AI generating: ", end="", flush=True)
+        
+        for line in response.iter_lines():
+            if line:
+                try:
+                    data = json.loads(line.decode("utf-8"))
+                    if "message" in data:
+                        content = data["message"]["content"]
+                        # print(content, end="", flush=True)
+                        full_response_text += content
+                except:
+                    pass
+        # print() # Newline after streaming
+        
+        clean_text = full_response_text.strip()
+        
+        if clean_text:
+            # We return the RAW response now, so the tools are preserved for the parser.
+            # The cleaning will happen in query_llm or separate helper.
+            return clean_text, True 
         else:
-            return "Sorry, could you repeat that?"
+            return "Sorry, could you repeat that?", False
             
     except Exception as e:
-        print(f"❌ LLM Error: {e}")
-        return "I didn't catch that. Could you say it again?"
+        print(f"\n❌ LLM Error: {e}")
+        return "I didn't catch that. Could you say it again?", False
+
 
 # -----------------------------
 # MAIN ORDER SYSTEM
@@ -347,6 +416,189 @@ class OrderSystem:
         self.temp_item = {}
         self.customer_address = ""
         self.customer_phone = ""
+        
+        # Initialize conversation history
+        pizza_flavors_str = ", ".join([f.title() for f in PIZZA_FLAVORS])
+        self.system_prompt = f"""You are a friendly restaurant order assistant.
+
+AVAILABLE PIZZA FLAVORS: {pizza_flavors_str}
+AVAILABLE SIZES: Small, Regular, Medium, Large, XXL
+
+TOOLS:
+1. `[ADD_ITEM: {{"name": "...", "size": "...", "quantity": ...}}]` 
+   - Use this IMMEDIATELY when the user confirms an item.
+2. `[SET_DETAILS: {{"address": "...", "phone": "..."}}]`
+   - Use this when the user provides address and phone.
+3. `[SAVE_ORDER]`
+   - Use this ONLY when the order is CONFIRMED and you have address and phone.
+
+RULES:
+1. Keep responses SHORT (max 15 words).
+2. Use tools explicitly with valid JSON.
+3. If address/phone is missing, ask for it.
+4. Do NOT use `[SAVE_ORDER]` or say "Order Confirmed" if you don't have the address and phone.
+5. If STATUS says MISSING DETAILS, you MUST ask for them. NEVER successfully confirm.
+6. NEVER use placeholders like "..." in tools. Ask the user if you don't know and wait for their response.
+6. Example: "Got it! [SET_DETAILS: {{"address": "123 Main", "phone": "555"}}] Confirm order?"
+
+Respond naturally."""
+
+        self.conversation_history = [
+            {"role": "system", "content": self.system_prompt}
+        ]
+
+    def add_user_message(self, text, context=""):
+        # Append user message with optional context injection
+        content = text
+        if context:
+            content = f"Instruction: {context}\nUser: {text}"
+        
+        self.conversation_history.append({"role": "user", "content": content})
+
+    def add_assistant_message(self, text):
+        self.conversation_history.append({"role": "assistant", "content": text})
+        
+    def query_llm(self, user_text, context=""):
+        # Inject current order state into context
+        order_summary = "Empty"
+        if self.current_order:
+            order_summary = ", ".join([f"{item['quantity']}x {item['size']} {item['name']}" for item in self.current_order])
+        
+        full_context = f"Current Order Cart: [{order_summary}]. "
+        
+        missing = []
+        if not is_valid_address(self.customer_address): missing.append("Address")
+        if not is_valid_phone(self.customer_phone): missing.append("Phone")
+        
+        if self.customer_address:
+            full_context += f"Address: {self.customer_address}. "
+        else:
+            full_context += "Address: NOT PROVIDED. "
+            
+        if self.customer_phone:
+            full_context += f"Phone: {self.customer_phone}. "
+        else:
+            full_context += "Phone: NOT PROVIDED. "
+            
+        if missing:
+             full_context += f"STATUS: MISSING DETAILS ({', '.join(missing)}). DO NOT CONFIRM ORDER. ASK FOR MISSING DETAILS."
+        else:
+             full_context += "STATUS: ALL DETAILS PRESENT. READY TO CONFIRM."
+        
+        full_context += " " + context
+        
+        # Reinforce tool usage if we are building an order
+        if self.temp_item or self.state in [OrderState.ASK_FLAVOR, OrderState.ASK_SIZE, OrderState.ASK_ITEM]:
+             full_context += " IMPORTANT: If the user provided item details (name/size/quantity), you MUST use the `[ADD_ITEM]` tool in your response. Do not just blindly acknowledge."
+        
+        self.add_user_message(user_text, full_context)
+        # Call LLM - getting RAW response now
+        response, _ = call_llm(self.conversation_history) 
+        
+        # Parse tools from raw response
+        self.parse_and_execute_tools(response)
+        
+        # Clean response for TTS and history (so tools don't pollute the context/speech)
+        cleaned_response = re.sub(r'\[.*?\]', '', response).strip()
+        if not cleaned_response: cleaned_response = "Done." # Fallback if only tool was output
+        
+        self.add_assistant_message(response) # Add raw response to history so LLM knows it called the tool
+        return cleaned_response, False 
+    
+    def parse_and_execute_tools(self, response):
+        """Parse and execute tools from LLM response"""
+        # Parse ADD_ITEM
+        add_item_match = re.search(r'\[ADD_ITEM: ({.*?})\]', response)
+        if add_item_match:
+            try:
+                raw_json = add_item_match.group(1)
+                try:
+                    item_data = json.loads(raw_json)
+                except:
+                    item_data = ast.literal_eval(raw_json)
+                
+                # Check for incomplete data (Ellipsis or placeholders)
+                # Note: valid quantity is int. valid size/name are strings not containing "..."
+                
+                is_incomplete = False
+                
+                # Clean up Quantity
+                if item_data.get("quantity") is Ellipsis or str(item_data.get("quantity")) == "...":
+                    item_data["quantity"] = 1
+                
+                # Clean up Name/Size and detect incompleteness
+                for field in ["name", "size"]:
+                    val = item_data.get(field)
+                    if val is Ellipsis or val is None or "..." in str(val) or val == "":
+                        if field == "size": # Size is allowed to be missing (we will ask for it)
+                            item_data[field] = None 
+                            is_incomplete = True
+                        elif field == "name": # Name must be present generally, but if missing we can ask
+                             item_data[field] = None
+                             is_incomplete = True
+
+                if is_incomplete:
+                     # If incomplete, we store in temp_item to trigger state machine follow-up
+                     # But only if we have at least a name or category (which isn't in this dict usually)
+                     if item_data.get("name"):
+                         self.temp_item = item_data
+                         self.state = OrderState.ASK_SIZE
+                         print(f"🔄 Partial item detected, waiting for details: {item_data}")
+                     else:
+                         print("⚠️ Ignored item with no name.")
+                else:
+                    self.current_order.append(item_data)
+                    print(f"📦 Added item: {item_data}")
+            except Exception as e:
+                print(f"x Failed to parse item: {e}")
+                print(f"   Raw content: {add_item_match.group(1)}")
+        
+        # Parse SET_DETAILS
+        details_match = re.search(r'\[SET_DETAILS: ({.*?})\]', response)
+        if details_match:
+            try:
+                raw_json = details_match.group(1)
+                try:
+                    details = json.loads(raw_json)
+                except:
+                    details = ast.literal_eval(raw_json)
+                
+                if "address" in details: self.customer_address = details["address"]
+                if "phone" in details: self.customer_phone = details["phone"]
+                print(f"📝 Details set: {details}")
+            except Exception as e:
+                print(f"❌ Failed to parse details: {e}")
+                print(f"   Raw content: {details_match.group(1)}")
+                
+        # Parse SAVE_ORDER
+        if "[SAVE_ORDER]" in response:
+            if self.current_order and self.customer_address and self.customer_phone:
+                pos_resp = send_to_pos({
+                    "items": self.current_order,
+                    "address": self.customer_address,
+                    "phone": self.customer_phone
+                })
+                if pos_resp["status"] == "success":
+                    speak(f"Order {pos_resp['order_id']} placed successfully!")
+                    time.sleep(1)
+                    sys.exit(0) # Exit after saving
+                else:
+                    speak(f"I cannot save the order yet. {pos_resp['message']}")
+            else:
+                print("❌ Missing details, cannot save yet.")
+
+    def get_order_summary_text(self):
+        if not self.current_order:
+            return "You haven't ordered anything yet."
+        summary = ", ".join([f"{item['quantity']} {item['size']} {item['name']}" for item in self.current_order])
+        return f"You have ordered: {summary}."
+
+    def check_order_inquiry(self, text_lower):
+        inquiry_keywords = ["what i ordered", "my order", "cart", "basket", "what did i order", "what have i ordered", "check order"]
+        if any(k in text_lower for k in inquiry_keywords):
+            speak(self.get_order_summary_text())
+            return True
+        return False
         
     def process_input(self, user_text):
         text_lower = user_text.lower()
@@ -384,13 +636,43 @@ class OrderSystem:
     def handle_greeting(self, user_text):
         text_lower = user_text.lower()
         
+        if self.check_order_inquiry(text_lower):
+            return "CONTINUE"
+        
+
+    def is_menu_inquiry(self, text):
+        text_lower = text.lower()
+        # Use word boundaries for short keywords like "list", "have", "all", "what"
+        # Longer keywords like "menu" are safer but consistent to use boundaries or specific checks
+        
+        # Regex for strict keyword matching
+        keywords = r"\b(list|menu|have|available|options|flavors|flavours|all|tell me)\b"
+        if re.search(keywords, text_lower):
+            return True
+            
+        # Specific combination check for "what" (e.g. "what do you have" vs "what is your name")
+        # "what" by itself is too broad, handled by specific logic in callers usually, 
+        # but here we can check "what" + "menu"/"have" intersection if needed.
+        # Original logic was: if "what" in text and "menu" in text: keywords.append("what")
+        # Let's simplify: if they say "what", we only count it if "menu" or "have" is also there.
+        
+        if re.search(r"\bwhat\b", text_lower) and re.search(r"\b(menu|have|available)\b", text_lower):
+            return True
+            
+        return False
+
+    def handle_greeting(self, user_text):
+        text_lower = user_text.lower()
+        
+        if self.check_order_inquiry(text_lower):
+            return "CONTINUE"
+        
         # Check if asking for menu first
-        menu_keywords = ["what", "which", "list", "menu", "have", "available", "options", "flavors", "flavours", "all", "tell me"]
-        if any(keyword in text_lower for keyword in menu_keywords) and not is_pizza_request(text_lower):
+        if self.is_menu_inquiry(user_text):
             flavor_list = [flavor.title() for flavor in PIZZA_FLAVORS]
             
             # If they want ALL flavors
-            if "all" in text_lower or "tell me all" in text_lower:
+            if re.search(r"\b(all|tell me all)\b", text_lower):
                 flavors_str = ", ".join(flavor_list)
                 speak(f"We have {flavors_str}. What would you like to order?")
             else:
@@ -414,21 +696,27 @@ class OrderSystem:
                 speak(f"Sure! {qty} pizza. Which flavor? Chicken Surprise, Jamaican BBQ, Chicago Bold Fold, or any other?")
         else:
             # Use LLM for greeting responses
-            print("🤖 Using AI to respond...")
+            # print("🤖 Using AI to respond...")
             context = "Customer just started conversation. Guide them to order pizza."
-            response = call_llm(user_text, context)
+            response, save_trigger = self.query_llm(user_text, context)
             speak(response)
+            if save_trigger:
+                 # If LLM triggered save here (unlikely in greeting but possible if user says "reorder last" etc)
+                 # For now just log it or ignore if no items.
+                 pass
         return "CONTINUE"
     
     def handle_ask_item(self, user_text):
         text_lower = user_text.lower()
         
+        if self.check_order_inquiry(text_lower):
+            return "CONTINUE"
+        
         # Check for menu inquiry
-        menu_keywords = ["what", "which", "list", "menu", "have", "available", "all", "tell me"]
-        if any(keyword in text_lower for keyword in menu_keywords):
+        if self.is_menu_inquiry(user_text):
             flavor_list = [flavor.title() for flavor in PIZZA_FLAVORS]
             
-            if "all" in text_lower or "tell me all" in text_lower:
+            if re.search(r"\b(all|tell me all)\b", text_lower):
                 flavors_str = ", ".join(flavor_list)
                 speak(f"We have {flavors_str}. What would you like?")
             else:
@@ -450,23 +738,27 @@ class OrderSystem:
                 speak(f"{qty} pizza. Which flavor would you like?")
         else:
             # Use LLM for intelligent response
-            print("🤖 Using AI to understand...")
+            # print("🤖 Using AI to understand...")
             context = "Customer should order pizza. Guide them naturally."
-            response = call_llm(user_text, context)
+            response, save_trigger = self.query_llm(user_text, context)
             speak(response)
+            if save_trigger:
+                 pass # Cannot save without items
         return "CONTINUE"
     
     def handle_ask_flavor(self, user_text):
         text_lower = user_text.lower()
         
+        if self.check_order_inquiry(text_lower):
+            return "CONTINUE"
+        
         # Check if asking for menu/flavors list
-        menu_keywords = ["what", "which", "list", "menu", "flavors", "flavours", "options", "have", "available", "all", "tell me"]
-        if any(keyword in text_lower for keyword in menu_keywords):
+        if self.is_menu_inquiry(user_text):
             # List all pizza flavors
             flavor_list = [flavor.title() for flavor in PIZZA_FLAVORS]
             
             # If they want ALL flavors, show more
-            if "all" in text_lower or "tell me" in text_lower:
+            if re.search(r"\b(all|tell me)\b", text_lower):
                 flavors_str = ", ".join(flavor_list)
                 speak(f"We have {flavors_str}. Which one would you like?")
             else:
@@ -481,9 +773,9 @@ class OrderSystem:
             speak(f"{flavor.title()} pizza! Which size? Small, Regular, Medium, Large, or XXL?")
         else:
             # Use LLM for intelligent response
-            print("🤖 Using AI to understand...")
-            context = f"Customer is choosing pizza flavor. They said: '{user_text}'"
-            response = call_llm(user_text, context)
+            # print("🤖 Using AI to understand...")
+            context = f"Customer is choosing pizza flavor. Current state: Asking flavor."
+            response, save_trigger = self.query_llm(user_text, context)
             speak(response)
         return "CONTINUE"
     
@@ -502,9 +794,10 @@ class OrderSystem:
             self.state = OrderState.ASK_MORE
         else:
             # Use LLM for intelligent response
-            print("🤖 Using AI to understand size...")
-            context = f"Customer is choosing pizza size. Available: Small, Regular, Medium, Large, XXL. They said: '{user_text}'"
-            response = call_llm(user_text, context)
+            # print("🤖 Using AI to understand size...")
+            # Ensure we don't fall back to endless flavor loop if size is misunderstood
+            context = f"Customer is choosing pizza size. Available: Small, Regular, Medium, Large, XXL."
+            response, save_trigger = self.query_llm(user_text, context)
             speak(response)
         return "CONTINUE"
     
@@ -512,8 +805,17 @@ class OrderSystem:
         text_lower = user_text.lower()
         
         if any(word in text_lower for word in ["no", "nope", "that's all", "thats all", "done", "finish", "nothing", "bas", "enough"]):
-            self.state = OrderState.COLLECT_ADDRESS
-            speak("Great! Now, please provide your full delivery address.")
+            # Check if we have valid details to skip collection
+            if not is_valid_address(self.customer_address):
+                self.state = OrderState.COLLECT_ADDRESS
+                speak("Great! Now, please provide your full delivery address.")
+            elif not is_valid_phone(self.customer_phone):
+                self.state = OrderState.COLLECT_PHONE
+                speak("Got the address. And your phone number please?")
+            else:
+                # All details present, go straight to confirm
+                self.state = OrderState.CONFIRM_ORDER
+                self.handle_collect_phone(self.customer_phone) # Reuse summary logic
             return "CONTINUE"
         elif is_pizza_request(text_lower):
             qty = extract_quantity(user_text)
@@ -529,10 +831,26 @@ class OrderSystem:
                 speak(f"{qty} pizza. Which flavor?")
         else:
             # Use LLM for intelligent response
-            print("🤖 Using AI to understand...")
-            context = f"Customer can add more items or finish order. They said: '{user_text}'"
-            response = call_llm(user_text, context)
+            # print("🤖 Using AI to understand...")
+            context = f"Customer can add more items or finish order. Current items: {len(self.current_order)}"
+            response, save_trigger = self.query_llm(user_text, context)
             speak(response)
+            
+            if save_trigger:
+                if len(self.current_order) > 0:
+                    pos_resp = send_to_pos({
+                        "items": self.current_order,
+                        "address": self.customer_address,
+                        "phone": self.customer_phone
+                    })
+                    if pos_resp["status"] == "success":
+                        speak(f"Order saved by AI command. Order ID {pos_resp['order_id']}.")
+                        return "EXIT"
+                    else:
+                        speak(f"Could not save order. {pos_resp['message']}")
+                        return "CONTINUE"
+                else:
+                    speak("I can't save an empty order.")
         return "CONTINUE"
     
     def handle_collect_address(self, user_text):
@@ -542,8 +860,8 @@ class OrderSystem:
         return "CONTINUE"
     
     def handle_collect_phone(self, user_text):
-        # Extract phone number
-        phone_match = re.search(r'\d{10,11}', user_text.replace(" ", ""))
+        # Extract phone number - update regex for 9-15 digits
+        phone_match = re.search(r'\d{9,15}', user_text.replace(" ", "").replace("-", ""))
         if phone_match:
             self.customer_phone = phone_match.group()
             self.state = OrderState.CONFIRM_ORDER
@@ -574,9 +892,17 @@ class OrderSystem:
                 "phone": self.customer_phone
             })
             
-            speak(f"Perfect! Your order {pos_resp['order_id']} is confirmed. Estimated delivery in 30-45 minutes. Thank you!")
-            print(f"\n✅ Order {pos_resp['order_id']} saved successfully!")
-            return "EXIT"
+            if pos_resp["status"] == "success":
+                speak(f"Perfect! Your order {pos_resp['order_id']} is confirmed. Estimated delivery in 30-45 minutes. Thank you!")
+                print(f"\n✅ Order {pos_resp['order_id']} saved successfully!")
+                return "EXIT"
+            else:
+                speak(f"I can't confirm yet. {pos_resp['message']}")
+                # If validation fails, stay in proper state to collect missing info
+                # Here we just go back to asking if they want to change anything or provide info
+                if "address" in pos_resp["message"] or "phone" in pos_resp["message"]:
+                     self.state = OrderState.COLLECT_ADDRESS if "address" in pos_resp["message"] else OrderState.COLLECT_PHONE
+
         else:
             speak("No problem. What would you like to change?")
             self.state = OrderState.ASK_MORE
