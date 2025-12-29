@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 *.mp3
 *.wav
 *.flac
@@ -9,3 +10,6 @@
 *.alac
 *.mp4
 *.avi
+=======
+*.pyc
+>>>>>>> 4a1a42f612fb4f362ade66ec2bac1ceb2f24092b
