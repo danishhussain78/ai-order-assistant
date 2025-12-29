@@ -1,45 +1,23 @@
-import requests
-import pygame
-import tempfile
+# from TTS.api import TTS
+# import os
+
+# tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+
+# text = "Salam sir, aap ka pizza ready hai."
+
+# tts.tts_to_file(
+#     text=text,
+#     speaker=None,   # use default speaker
+#     speaker_wav="imrankhan.wav",  # path to speaker reference audio
+#     language="hi",
+#     file_path="output.wav"
+# )
+
+# os.system("start output.wav")
+from gtts import gTTS
 import os
 
-HF_API_KEY = "YOUR_HUGGINGFACE_API_KEY"
-
-def speak(text):
-    print(f"AI: {text}")
-    if not text.strip():
-        return
-
-    url = "https://api-inference.huggingface.co/models/coqui/xtts-v2"
-
-    headers = {
-        "Authorization": f"Bearer {HF_API_KEY}"
-    }
-
-    payload = {
-        "inputs": text,
-        "parameters": {
-            "language": "hi",       # Hindi + English mixed (Hinglish)
-            "speaker": "male"       # Deep male voice
-        }
-    }
-
-    response = requests.post(url, headers=headers, json=payload)
-
-    if response.status_code != 200:
-        print(response.text)
-        return
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as fp:
-        fp.write(response.content)
-        temp_path = fp.name
-
-    pygame.mixer.init()
-    pygame.mixer.music.load(temp_path)
-    pygame.mixer.music.play()
-
-    while pygame.mixer.music.get_busy():
-        pygame.time.Clock().tick(10)
-
-    pygame.mixer.quit()
-    os.remove(temp_path)
+text = "Salam sir, aap ka pizza ready hai."
+tts = gTTS(text=text, lang="hi", tld="com.pk")
+tts.save("output.mp3")
+os.system("start output.mp3")
